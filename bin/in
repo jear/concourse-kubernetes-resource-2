@@ -1,0 +1,81 @@
+#!/bin/bash
+set -eu
+set -o pipefail
+
+exec 3>&1 # make stdout available as fd 3 for the result
+exec 1>&2 # redirect all output to stderr for logging
+
+##################
+### Get Task Input
+##################
+TMPDIR=${TMPDIR:-/tmp}
+payload="$(mktemp "$TMPDIR/k8s-resource-request.XXXXXX")"
+cat > "$payload" <&0
+
+# test for debug
+DEBUG=$(jq -r .source.debug < "$payload")
+[[ "$DEBUG" == "true" ]] && { echo "Enabling debug mode.";set -x; }
+
+
+
+##################
+## Functions
+##################
+auth_kubo() {
+    mkdir -p /root/.kube
+    if [[ "$KUBE_URL" =~ https.* ]]; then
+        KUBE_CA=$(jq -r .source.cluster_ca < "$payload")
+        CA_PATH="/root/.kube/ca.pem"
+        echo "$KUBE_CA" | base64 -d > $CA_PATH
+    fi
+
+    $KUBECTL config set-cluster myk8s --server=$KUBE_URL --certificate-authority=/root/.kube/ca.pem
+    $KUBECTL config set-credentials "$ADMIN_USER" --token=$ADMIN_TOKEN
+    $KUBECTL config set-context myk8s --cluster=myk8s --user="$ADMIN_USER"
+    $KUBECTL config use-context myk8s
+}
+
+##################
+## Main Logic
+##################
+
+KUBECTL="/usr/local/bin/kubectl"
+KUBE_URL=$(jq -r .source.cluster_url < "$payload")
+NAMESPACE=$(jq -r .source.namespace < "$payload")
+ADMIN_USER=$(jq -r .source.admin_user < "$payload")
+ADMIN_TOKEN=$(jq -r .source.admin_token < "$payload")
+
+# get resource id
+RESOURCE_TYPE=$(jq -r .source.resource_type < "$payload")
+RESOURCE_NAME=$(jq -r .source.resource_name < "$payload")
+RESOURCE_PATH=$(jq -r .params.resource_path < "$payload")
+CONTAINER_NAME=$(jq -r .source.container_name < "$payload")
+
+if [[ -z "$RESOURCE_TYPE" ]]; then
+    RESOURCE_TYPE=$(jq -r .params.resource_type < "$payload")
+fi
+
+if [[ -z "$RESOURCE_NAME" ]]; then
+    RESOURCE_TYPE=$(jq -r .params.resource_name < "$payload")
+fi
+
+if [[ "$CONTAINER_NAME" == "null" ]]; then
+  CONTAINER_NAME=$RESOURCE_NAME
+fi
+
+
+if [[ -z "$RESOURCE_TYPE" ]] || [[ -z "$RESOURCE_NAME" ]]; then
+    result=$(jq -n "[]")
+else
+    export KUBECTL
+
+    RESOURCE="$RESOURCE_TYPE/$RESOURCE_NAME"
+    auth_kubo
+    echo "Returning $RESOURCE ..."
+    IMG=$($KUBECTL get -o json "$RESOURCE" | jq -r '.spec.template.spec.containers[0].image')
+
+    result="$(jq -n "{version:{container:\"$IMG\"}}")"
+  fi
+
+  echo "$result" | jq -s add  >&3
+  ############################################################################

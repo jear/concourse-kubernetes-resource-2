@@ -1,0 +1,163 @@
+#!/bin/bash
+set -eu
+set -o pipefail
+
+exec 3>&1 # make stdout available as fd 3 for the result
+exec 1>&2 # redirect all output to stderr for logging
+
+##################
+### Get Task Input
+##################
+TMPDIR=${TMPDIR:-/tmp}
+payload="$(mktemp "$TMPDIR/k8s-resource-request.XXXXXX")"
+cat > "$payload" <&0
+
+# test for debug
+DEBUG=$(jq -r .source.debug < "$payload")
+[[ "$DEBUG" == "true" ]] && { echo "Enabling debug mode.";set -x; }
+
+##################
+## Functions
+##################
+auth_kubo() {
+    mkdir -p /root/.kube
+    if [[ "$KUBE_URL" =~ https.* ]]; then
+        KUBE_CA=$(jq -r .source.cluster_ca < "$payload")
+        CA_PATH="/root/.kube/ca.pem"
+        echo "$KUBE_CA" | base64 -d > $CA_PATH
+        ADMIN_CERT=$(jq -r .source.admin_cert < "$payload")
+        CA_PATH="/root/.kube/admin_cert.pem"
+        echo "$ADMIN_CERT" | base64 -d > $CA_PATH
+    fi
+
+    $KUBECTL config set-cluster myk8s --server=$KUBE_URL --certificate-authority=/root/.kube/ca.pem --client-certificate=/root/.kube/admin_cert.pem
+    #$KUBECTL config set-cluster myk8s --server=$KUBE_URL --insecure-skip-tls-verify=true
+    $KUBECTL config set-credentials "$ADMIN_USER" --token=$ADMIN_TOKEN
+    $KUBECTL config set-context myk8s --cluster=myk8s --user="$ADMIN_USER"
+    $KUBECTL config use-context myk8s
+}
+
+deployment() {
+    DEPLOYMENT=$1
+    IMG=$2
+
+    [ -n "$DEPLOYMENT" ] || exit 1
+    [ -n "$IMG" ] || exit 1
+
+    if [[ $OVERWRITE == "true" ]]; then
+        if [[ $($KUBECTL describe deployment $DEPLOYMENT 2>/dev/null >/dev/null && echo "true" || echo "false") == "true" ]]; then
+          echo "Deployment $DEPLOYMENT exists ... overwite=true so rolling-update wil be executed"
+          rolling-update "$RESOURCE_NAME" "$CONTAINER_NAME" "$IMG"
+        else
+          echo "$KUBECTL run $DEPLOYMENT --image=$IMG --port=$RESOURCE_PORT"
+          $KUBECTL run $DEPLOYMENT --image=$IMG --port=$RESOURCE_PORT
+        fi
+    fi
+}
+
+rolling-update() {
+    DEPLOYMENT=$1
+    CONTAINER=$2
+    IMAGE=$3
+
+    [ -n "$DEPLOYMENT" ] || exit 1
+    [ -n "$CONTAINER" ] || exit 1
+    [ -n "$IMAGE" ] || exit 1
+
+    $KUBECTL set image deployment/$DEPLOYMENT $CONTAINER="$IMAGE"
+}
+
+service() {
+
+    SVC_NAME=$(jq -r .params.service_name < "$payload")
+    SVC_TYPE=$(jq -r .params.service_type < "$payload")
+    DEPLOYMENT=$(jq -r .params.deployment_name < "$payload")
+    SVC_PORT=$(jq -r .params.service_port < "$payload")
+    SVC_TARGET_PORT=$(jq -r .params.target_port < "$payload")
+
+    [ -n "$DEPLOYMENT" ] || exit 1
+
+
+    if [[ $OVERWRITE == "true" ]]; then
+      if [[ $($KUBECTL describe service $SVC_NAME 2>/dev/null >/dev/null && echo "true" || echo "false") == "true" ]]; then
+        echo "Service $SVC_NAME exists ... overwite=true so service will be re-created with new spec"
+        $KUBECTL delete service $SVC_NAME
+        sleep 3
+      fi
+    fi
+
+    SVC_JSON=$($KUBECTL expose deployment $DEPLOYMENT --type=$SVC_TYPE --name=$SVC_NAME --port=$SVC_PORT --target-port=$SVC_TARGET_PORT --dry-run=true -o json | jq ".spec.ports[].nodePort = $SVC_PORT")
+    $KUBECTL expose deployment $DEPLOYMENT --type=$SVC_TYPE --name=$SVC_NAME --port=$SVC_PORT --target-port=$SVC_TARGET_PORT --overrides="$SVC_JSON"
+}
+
+
+##################
+## Main Logic
+##################
+
+KUBECTL="/usr/local/bin/kubectl"
+KUBE_URL=$(jq -r .source.cluster_url < "$payload")
+NAMESPACE=$(jq -r .source.namespace < "$payload")
+ADMIN_USER=$(jq -r .source.admin_user < "$payload")
+ADMIN_TOKEN=$(jq -r .source.admin_token < "$payload")
+OVERWRITE=$(jq -r .source.overwrite < "$payload")
+
+# get image name
+IMG_FILE=$(jq -r .params.image_name < "$payload")
+IMG=$(echo "$IMG_FILE")
+TAG_FILE=$(jq -r .params.image_tag < "$payload")
+TAG=$(echo "$TAG_FILE")
+IMG="$IMG:$TAG"
+
+# get resource id
+RESOURCE_TYPE=$(jq -r .source.resource_type < "$payload")
+RESOURCE_NAME=$(jq -r .source.resource_name < "$payload")
+RESOURCE_PATH=$(jq -r .params.resource_path < "$payload")
+RESOURCE_PORT=$(jq -r .params.port < "$payload")
+CONTAINER_NAME=$(jq -r .source.container_name < "$payload")
+
+if [[ -z "$RESOURCE_TYPE" ]]; then
+    RESOURCE_TYPE=$(jq -r .params.resource_type < "$payload")
+fi
+
+if [[ -z "$RESOURCE_NAME" ]]; then
+    RESOURCE_TYPE=$(jq -r .params.resource_name < "$payload")
+fi
+
+if [[ "$CONTAINER_NAME" == "null" ]]; then
+  CONTAINER_NAME=$RESOURCE_NAME
+fi
+
+
+
+# Case Action Selector
+case $RESOURCE_TYPE in
+    deployment)
+
+      auth_kubo
+      deployment "$RESOURCE_NAME" "$IMG"
+      ;;
+
+    rolling-update)
+
+      auth_kubo
+      rolling-update "$RESOURCE_NAME" "$CONTAINER_NAME" "$IMG"
+      ;;
+
+    service)
+
+      auth_kubo
+      service
+      ;;
+
+    *)
+      echo "Resource type $RESOURCE_TYPE not yet supported"
+      exit 1
+      ;;
+esac
+
+##################
+# Echo Action Result to json
+##################
+result="$(jq -n "{version:{container:\"$IMG\"}}")"
+echo "$result" | jq -s add  >&3
